@@ -341,33 +341,47 @@ class SupplierRepo:
         phone = (data.get("phone") or None)
         email = (data.get("email") or None)
 
-        supplier_id = data.get("id")
-        if supplier_id:
-            supplier_id = int(supplier_id)
-            self.db.execute(
+        supplier_id = None
+        raw_id = data.get("id")
+        try:
+            supplier_id = int(raw_id)
+            if supplier_id <= 0:
+                supplier_id = None
+        except Exception:
+            supplier_id = None
+
+        if supplier_id is not None:
+            cur = self.db.execute(
                 "UPDATE suppliers SET name=%s, document=%s, phone=%s, email=%s WHERE id=%s",
                 (name, doc, phone, email, supplier_id),
             )
-        else:
-            cur = self.db.execute("SELECT id FROM suppliers WHERE name=%s LIMIT 1", (name,))
-            row = cur.fetchone()
-            if row:
-                supplier_id = int(row[0])
-                self.db.execute(
-                    "UPDATE suppliers SET document=%s, phone=%s, email=%s WHERE id=%s",
-                    (doc, phone, email, supplier_id),
-                )
-            else:
-                cur = self.db.execute(
-                    "INSERT INTO suppliers (name, document, phone, email) VALUES (%s, %s, %s, %s)",
-                    (name, doc, phone, email),
-                )
-                try:
-                    supplier_id = int(cur.lastrowid)
-                except Exception:
-                    cur2 = self.db.execute("SELECT id FROM suppliers WHERE name=%s ORDER BY id DESC LIMIT 1", (name,))
-                    row2 = cur2.fetchone()
-                    supplier_id = int(row2[0]) if row2 else None
+            if getattr(cur, "rowcount", 0) > 0:
+                self.db.commit()
+                return supplier_id
+            supplier_id = None
+
+        cur = self.db.execute("SELECT id FROM suppliers WHERE name=%s LIMIT 1", (name,))
+        row = cur.fetchone()
+        if row:
+            supplier_id = int(row[0])
+            self.db.execute(
+                "UPDATE suppliers SET document=%s, phone=%s, email=%s WHERE id=%s",
+                (doc, phone, email, supplier_id),
+            )
+            self.db.commit()
+            return supplier_id
+
+        cur = self.db.execute(
+            "INSERT INTO suppliers (name, document, phone, email) VALUES (%s, %s, %s, %s)",
+            (name, doc, phone, email),
+        )
+        try:
+            supplier_id = int(cur.lastrowid)
+        except Exception:
+            cur2 = self.db.execute("SELECT id FROM suppliers WHERE name=%s ORDER BY id DESC LIMIT 1", (name,))
+            row2 = cur2.fetchone()
+            supplier_id = int(row2[0]) if row2 else None
+
         self.db.commit()
         return supplier_id
 
@@ -375,6 +389,33 @@ class SupplierRepo:
         self.db.execute("UPDATE products SET supplier_id=NULL WHERE supplier_id=%s", (supplier_id,))
         self.db.execute("DELETE FROM suppliers WHERE id=%s", (supplier_id,))
         self.db.commit()
+
+    def save(self):
+        try:
+            sid_txt = (self.var_id.get() or "").strip()
+            try:
+                sid_val = int(sid_txt)
+                if sid_val <= 0:
+                    sid_val = None
+            except Exception:
+                sid_val = None
+
+            data = {
+                "id": sid_val,
+                "name": self.var_name.get().strip(),
+                "document": self.var_document.get().strip(),
+                "phone": self.var_phone.get().strip(),
+                "email": self.var_email.get().strip(),
+            }
+
+            sid = self.repo.upsert(data)
+            messagebox.showinfo("OK", f"Fornecedor salvo/atualizado (ID {sid}).")
+
+            self.ent_search.delete(0, 'end')
+            self.refresh()
+            self.clear()
+        except Exception as e:
+            messagebox.showerror("Erro", f"Falha ao salvar: {e}")
 
 class ProductRepo:
     def __init__(self, db: DB): self.db = db
