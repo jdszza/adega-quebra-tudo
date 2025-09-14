@@ -360,8 +360,31 @@ class SupplierRepo:
 class ProductRepo:
     def __init__(self, db: DB): self.db = db
     def upsert(self, data: dict):
-        cost = to_decimal(data.get('cost_price')); margin = to_decimal(data.get('margin_pct'))
-        sale_price = (cost * (Decimal('1.0') + (margin/Decimal('100')))).quantize(MONEY_Q)
+
+        cost = to_decimal(data.get('cost_price'))
+        margin = to_decimal(data.get('margin_pct'))
+        sp_raw = data.get('sale_price')
+
+        sale_price_input = None
+        try:
+            if sp_raw is not None and str(sp_raw).strip() != "":
+                sale_price_input = to_decimal(sp_raw)
+        except Exception:
+            sale_price_input = None
+
+        if sale_price_input is not None and sale_price_input >= Decimal("0"):
+            sale_price = sale_price_input.quantize(MONEY_Q)
+            if cost > 0:
+                margin = ((sale_price / cost) - Decimal('1')) * Decimal('100')
+        else:
+            sale_price = (cost * (Decimal('1.0') + (margin/Decimal('100')))).quantize(MONEY_Q)
+
+        data['sale_price'] = sale_price
+        try:
+            data['margin_pct'] = margin.quantize(Decimal('0.01'))
+        except Exception:
+            data['margin_pct'] = margin
+    
         data['sale_price'] = sale_price; data['updated_at'] = datetime.now()
         cur = self.db.execute("SELECT id FROM products WHERE sku=%s", (data['sku'],)); row = cur.fetchone()
         cols = ['sku','barcode','name','item_type','category','brand','varietal','vintage','volume_ml','abv','country','region',
@@ -580,8 +603,12 @@ class PosPage(tb.Frame):
         self.lbl_total = tb.Label(pay, text="TOTAL: R$ 0,00", font=("Segoe UI", 12, "bold"), bootstyle=SUCCESS); self.lbl_total.pack(side="right", padx=12)
         btns = tb.Frame(self); btns.pack(fill="x", padx=12, pady=8)
         tb.Button(btns, text="Finalizar Venda (F2)", command=self.finish_sale, bootstyle=PRIMARY).pack(side="left")
+        tb.Button(btns, text="Alterar Qtd (F3)", command=self.edit_qty, bootstyle=SECONDARY).pack(side="left", padx=6)
         tb.Button(btns, text="Remover item", command=self.remove_selected, bootstyle=SECONDARY).pack(side="left", padx=6)
         tb.Button(btns, text="Limpar carrinho", command=self.clear_cart, bootstyle=SECONDARY).pack(side="left")
+        self.cart.bind("<Double-1>", lambda e: self.edit_qty())
+        self.bind_all("<F2>", lambda e: self.finish_sale())
+        self.bind_all("<F3>", lambda e: self.edit_qty())
         self.bind_all("<F2>", lambda e: self.finish_sale()); self._recalc()
     def add_by_barcode(self, event=None):
         code = self.ent_barcode.get().strip(); self.ent_barcode.delete(0, tk.END)
@@ -606,35 +633,136 @@ class PosPage(tb.Frame):
         for iid in self.cart.get_children(): vals = self.cart.item(iid, 'values'); subtotal += to_decimal(vals[4])
         self.lbl_subtotal.config(text=f"Subtotal: {money(subtotal)}"); self.lbl_total.config(text=f"TOTAL: {money(subtotal)}")
         return subtotal
+    def edit_qty(self):
+        sel = self.cart.selection()
+        if not sel:
+            messagebox.showwarning("Atenção", "Selecione um item para alterar a quantidade.")
+            return
+
+        iid = sel[0]
+        pid, name, qty, unit_price, line_total = self.cart.item(iid, 'values')
+
+        try:
+            current = int(qty)
+        except Exception:
+            current = 1
+
+        new_q = simpledialog.askinteger(
+            "Alterar quantidade",
+            f"Quantidade para '{name}':",
+            initialvalue=current,
+            minvalue=0,
+            parent=self
+        )
+        if new_q is None:
+            return
+
+        if new_q == 0:
+            self.cart.delete(iid)
+            self._recalc()
+            return
+
+        unit_price_dec = to_decimal(unit_price)
+        line_total_dec = (unit_price_dec * new_q).quantize(MONEY_Q)
+        self.cart.item(iid, values=(pid, name, new_q, f"{unit_price_dec}", f"{line_total_dec}"))
+        self._recalc()
+
     def finish_sale(self):
         items = []
         for iid in self.cart.get_children():
             pid, name, qty, unit_price, line_total = self.cart.item(iid, 'values')
-            items.append({'product_id': int(pid), 'name': name, 'qty': int(qty), 'unit_price': to_decimal(unit_price), 'line_total': to_decimal(line_total)})
-        if not items: messagebox.showwarning("Vazio", "Carrinho vazio."); return
-        subtotal = self._recalc(); payment = self.cmb_pay.get()
+            items.append({
+                'product_id': int(pid),
+                'name': name,
+                'qty': int(qty),
+                'unit_price': to_decimal(unit_price),
+                'line_total': to_decimal(line_total),
+            })
+        if not items:
+            messagebox.showwarning("Vazio", "Carrinho vazio.")
+            return
+
+        subtotal = self._recalc()
+        payment = self.cmb_pay.get()
         received = to_decimal(self.ent_received.get()) if payment == 'Dinheiro' else Decimal('0')
-        discount = Decimal('0'); total = subtotal - discount; change = (received - total) if payment == 'Dinheiro' else Decimal('0')
-        if payment == 'Dinheiro' and received < total: messagebox.showwarning("Atenção", "Valor recebido menor que o total."); return
-        sale_id = self.master.sales_repo.create_sale(user_id=self.master.state['user']['id'], payment_method=payment,
-                                                     subtotal=subtotal, discount=discount, total=total, received=received, change_due=change)
+        discount = Decimal('0')
+        total = subtotal - discount
+        change = (received - total) if payment == 'Dinheiro' else Decimal('0')
+        if payment == 'Dinheiro' and received < total:
+            messagebox.showwarning("Atenção", "Valor recebido menor que o total.")
+            return
+
+        # usa os repos passados ao PosPage
+        sale_id = self.sales_repo.create_sale(
+            user_id=self.state['user']['id'],
+            payment_method=payment,
+            subtotal=subtotal,
+            discount=discount,
+            total=total,
+            received=received,
+            change_due=change
+        )
+
         for it in items:
-            cur = self.master.product_repo.db.execute("SELECT cost_price, margin_pct FROM products WHERE id=%s", (it['product_id'],)); cost, margin = cur.fetchone()
-            self.master.sales_repo.add_item(sale_id=sale_id, product_id=it['product_id'], qty=it['qty'],
-                                            unit_price=it['unit_price'], unit_cost=to_decimal(cost), margin_pct=to_decimal(margin))
-            self.master.product_repo.adjust_stock(it['product_id'], -it['qty'])
-        cur = self.master.product_repo.db.execute("SELECT id, created_at, payment_method, subtotal, discount, total, received, change_due FROM sales WHERE id=%s", (sale_id,)); sale_row = cur.fetchone()
-        sale = {'id': sale_row[0], 'created_at': sale_row[1], 'payment_method': sale_row[2],
-                'subtotal': Decimal(sale_row[3]), 'discount': Decimal(sale_row[4]), 'total': Decimal(sale_row[5]),
-                'received': Decimal(sale_row[6]), 'change_due': Decimal(sale_row[7])}
-        items_full = [{'name': it['name'], 'qty': it['qty'], 'unit_price': it['unit_price'], 'line_total': (it['unit_price'] * it['qty']).quantize(MONEY_Q)} for it in items]
+            cur = self.product_repo.db.execute(
+                "SELECT cost_price, margin_pct FROM products WHERE id=%s", (it['product_id'],)
+            )
+            cost, margin = cur.fetchone()
+            self.sales_repo.add_item(
+                sale_id=sale_id,
+                product_id=it['product_id'],
+                qty=it['qty'],
+                unit_price=it['unit_price'],
+                unit_cost=to_decimal(cost),
+                margin_pct=to_decimal(margin)
+            )
+            self.product_repo.adjust_stock(it['product_id'], -it['qty'])
+
+        cur = self.product_repo.db.execute(
+            "SELECT id, created_at, payment_method, subtotal, discount, total, received, change_due "
+            "FROM sales WHERE id=%s", (sale_id,)
+        )
+        sale_row = cur.fetchone()
+        sale = {
+            'id': sale_row[0],
+            'created_at': sale_row[1],
+            'payment_method': sale_row[2],
+            'subtotal': Decimal(sale_row[3]),
+            'discount': Decimal(sale_row[4]),
+            'total': Decimal(sale_row[5]),
+            'received': Decimal(sale_row[6]),
+            'change_due': Decimal(sale_row[7]),
+        }
+
+        items_full = [{
+            'name': it['name'],
+            'qty': it['qty'],
+            'unit_price': it['unit_price'],
+            'line_total': (it['unit_price'] * it['qty']).quantize(MONEY_Q)
+        } for it in items]
+
         pix_payload = ""
         if payment == "PIX":
-            cur = self.master.product_repo.db.execute("SELECT store_name, pix_key, pix_merchant_city FROM settings WHERE id=1")
-            st = cur.fetchone(); store_name = (st[0] or "Minha Adega").upper(); pix_key = st[1] or ""; pix_city = (st[2] or "SAO PAULO").upper().replace(" ", "")
+            cur = self.product_repo.db.execute(
+                "SELECT store_name, pix_key, pix_merchant_city FROM settings WHERE id=1"
+            )
+            st = cur.fetchone()
+            store_name = (st[0] or "Minha Adega").upper()
+            pix_key = st[1] or ""
+            pix_city = (st[2] or "SAO PAULO").upper().replace(" ", "")
             pix_payload = build_pix_payload(pix_key, store_name, pix_city, amount=total, txid=f"VENDA{sale_id}")
-        self.master.printer.print_receipt(sale, items_full, attendant_name=self.master.state['user']['username'], pix_payload=pix_payload)
-        messagebox.showinfo("OK", f"Venda {sale_id} concluída. Total: {money(total)}" + (f" | Troco: {money(change)}" if payment=='Dinheiro' else "")); self.clear_cart()
+
+        self.printer.print_receipt(
+            sale, items_full, attendant_name=self.state['user']['username'], pix_payload=pix_payload
+        )
+
+        messagebox.showinfo(
+            "OK",
+            f"Venda {sale_id} concluída. Total: {money(total)}" +
+            (f" | Troco: {money(change)}" if payment == 'Dinheiro' else "")
+        )
+        self.clear_cart()
+
 
 class ReportsPage(tb.Frame):
     def __init__(self, master, sales_repo):
