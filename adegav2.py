@@ -1,20 +1,3 @@
-# -*- coding: utf-8 -*-
-"""
-Adega PDV – QuebraTudo UI (Tkinter + ttkbootstrap, com Branding)
-v3: corrigido erro de callback ao clicar no menu muito cedo
-    - páginas são criadas antes dos botões do menu
-    - status bar é criada antes
-    - show_page() tem guardas contra acesso antes da hora
-
-Instalação:
-    pip install ttkbootstrap
-    pip install mysql-connector-python
-    pip install python-escpos pyusb   # opcional – impressão térmica
-    pip install pillow                # opcional – redimensionar logo com qualidade
-
-Execução:
-    python adega_pdv_quebratudo_ui_v3.py
-"""
 import os
 import csv
 from datetime import datetime, date, timedelta
@@ -24,21 +7,18 @@ import hashlib, secrets
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog, simpledialog
 
-# ttkbootstrap
 try:
     import ttkbootstrap as tb
     from ttkbootstrap.constants import *
 except ImportError:
     raise SystemExit("Falta instalar 'ttkbootstrap'. Use: pip install ttkbootstrap")
 
-# Pillow (opcional) para logo
 try:
     from PIL import Image, ImageTk
     PIL_OK = True
 except Exception:
     PIL_OK = False
 
-# Banco e impressão
 try:
     import mysql.connector
 except ImportError:
@@ -101,6 +81,10 @@ class DB:
     def connect(self):
         try:
             self.conn = mysql.connector.connect(**self.config)
+            try:
+                self.conn.autocommit = True
+            except Exception:
+                pass
         except mysql.connector.errors.ProgrammingError as e:
             if "Unknown database" in str(e):
                 tmp = self.config.copy()
@@ -110,6 +94,10 @@ class DB:
                 cur.execute(f"CREATE DATABASE IF NOT EXISTS `{dbname}` DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci")
                 conn.commit(); cur.close(); conn.close()
                 self.conn = mysql.connector.connect(**self.config)
+                try:
+                    self.conn.autocommit = True
+                except Exception:
+                    pass
             else:
                 raise
     def cursor(self):
@@ -313,7 +301,7 @@ def build_pix_payload(key: str, merchant_name: str, merchant_city: str, amount: 
     tx = _emv_kv("05", txid[:25]); add = _emv_kv("62", tx); partial = pfi + mai + mcc + cur + amt + cty + mname + mcity + add + "6304"
     crc = _crc16_ccitt(partial.encode("utf-8")); return partial + f"{crc:04X}"
 
-# ===================== REPOSITÓRIOS (igual à v2) =====================
+# ===================== REPOSITÓRIOS =====================
 class UserRepo:
     def __init__(self, db: DB): self.db = db
     def get_by_username(self, username: str):
@@ -330,37 +318,67 @@ class UserRepo:
         self.db.execute("DELETE FROM users WHERE id=%s", (user_id,)); self.db.commit()
 
 class SupplierRepo:
-    def __init__(self, db: DB): self.db = db
+    def __init__(self, db: DB):
+        self.db = db
+
     def list_all(self, term: str = ""):
         like = f"%{term}%"
         cur = self.db.execute(
             "SELECT id, name, document, phone, email, created_at FROM suppliers "
-            "WHERE name LIKE %s OR document LIKE %s OR phone LIKE %s OR email LIKE %s "
-            "ORDER BY name LIMIT 500", (like, like, like, like))
+            "WHERE name LIKE %s OR IFNULL(document,'') LIKE %s "
+            "   OR IFNULL(phone,'') LIKE %s OR IFNULL(email,'') LIKE %s "
+            "ORDER BY name LIMIT 500",
+            (like, like, like, like),
+        )
         return cur.fetchall()
+
     def upsert(self, data: dict):
-        name = data.get("name","").strip()
-        if not name: raise ValueError("Nome do fornecedor é obrigatório.")
-        if data.get("id"):
-            self.db.execute("UPDATE suppliers SET name=%s, document=%s, phone=%s, email=%s WHERE id=%s",
-                            (data["name"], data.get("document"), data.get("phone"), data.get("email"), int(data["id"])))
+        name = (data.get("name") or "").strip()
+        if not name:
+            raise ValueError("Nome do fornecedor é obrigatório.")
+
+        doc = (data.get("document") or None)
+        phone = (data.get("phone") or None)
+        email = (data.get("email") or None)
+
+        supplier_id = data.get("id")
+        if supplier_id:
+            supplier_id = int(supplier_id)
+            self.db.execute(
+                "UPDATE suppliers SET name=%s, document=%s, phone=%s, email=%s WHERE id=%s",
+                (name, doc, phone, email, supplier_id),
+            )
         else:
-            cur = self.db.execute("SELECT id FROM suppliers WHERE name=%s", (name,)); row = cur.fetchone()
+            cur = self.db.execute("SELECT id FROM suppliers WHERE name=%s LIMIT 1", (name,))
+            row = cur.fetchone()
             if row:
-                self.db.execute("UPDATE suppliers SET document=%s, phone=%s, email=%s WHERE id=%s",
-                                (data.get("document"), data.get("phone"), data.get("email"), row[0]))
+                supplier_id = int(row[0])
+                self.db.execute(
+                    "UPDATE suppliers SET document=%s, phone=%s, email=%s WHERE id=%s",
+                    (doc, phone, email, supplier_id),
+                )
             else:
-                self.db.execute("INSERT INTO suppliers (name, document, phone, email) VALUES (%s,%s,%s,%s)",
-                                (data["name"], data.get("document"), data.get("phone"), data.get("email")))
+                cur = self.db.execute(
+                    "INSERT INTO suppliers (name, document, phone, email) VALUES (%s, %s, %s, %s)",
+                    (name, doc, phone, email),
+                )
+                try:
+                    supplier_id = int(cur.lastrowid)
+                except Exception:
+                    cur2 = self.db.execute("SELECT id FROM suppliers WHERE name=%s ORDER BY id DESC LIMIT 1", (name,))
+                    row2 = cur2.fetchone()
+                    supplier_id = int(row2[0]) if row2 else None
         self.db.commit()
+        return supplier_id
+
     def delete(self, supplier_id: int):
         self.db.execute("UPDATE products SET supplier_id=NULL WHERE supplier_id=%s", (supplier_id,))
-        self.db.execute("DELETE FROM suppliers WHERE id=%s", (supplier_id,)); self.db.commit()
+        self.db.execute("DELETE FROM suppliers WHERE id=%s", (supplier_id,))
+        self.db.commit()
 
 class ProductRepo:
     def __init__(self, db: DB): self.db = db
     def upsert(self, data: dict):
-
         cost = to_decimal(data.get('cost_price'))
         margin = to_decimal(data.get('margin_pct'))
         sp_raw = data.get('sale_price')
@@ -411,6 +429,12 @@ class ProductRepo:
         return categories, brands
     def get_by_barcode(self, barcode: str):
         cur = self.db.execute("SELECT id, name, sale_price, stock_qty, cost_price, margin_pct FROM products WHERE barcode=%s", (barcode,)); return cur.fetchone()
+    def get_full_by_id(self, pid: int):
+        cur = self.db.execute("SELECT * FROM products WHERE id=%s", (pid,))
+        row = cur.fetchone()
+        if not row: return None
+        cols = [d[0] for d in cur.description]
+        return dict(zip(cols, row))
     def adjust_stock(self, product_id: int, delta_qty: int):
         self.db.execute("UPDATE products SET stock_qty = stock_qty + %s, updated_at=NOW() WHERE id=%s", (delta_qty, product_id)); self.db.commit()
 
@@ -544,13 +568,40 @@ class ProductPage(tb.Frame):
         tb.Button(searchf, text="Importar CSV", command=self.import_csv, bootstyle=INFO).pack(side="left", padx=6)
         cols = ("id","sku","barcode","name","item_type","category","brand","sale_price","stock_qty","min_stock","expiry")
         self.tree = tb.Treeview(self, columns=cols, show="headings", height=12, bootstyle=INFO)
-        for c in cols: self.tree.heading(c, text=c); self.tree.column(c, width=110)
+        headers = {'id':'ID','sku':'SKU','barcode':'EAN','name':'Produto','item_type':'Tipo','category':'Categoria','brand':'Marca','sale_price':'Preço','stock_qty':'Estoque','min_stock':'Mínimo','expiry':'Validade'}
+        for c in cols: self.tree.heading(c, text=headers.get(c,c)); self.tree.column(c, width=120)
         self.tree.pack(fill="both", expand=True, padx=12, pady=12)
-        self._load_filters(); self.refresh_list()
+        self._load_filters(); self.refresh_list(); self.tree.bind("<Double-1>", self._on_tree_dblclick)
     def _load_filters(self):
         cats, brands = self.repo.get_filters(); self.cmb_cat["values"] = cats; self.cmb_brand["values"] = brands
-        if cats: self.cmb_cat.set(cats[0]); 
+        if cats: self.cmb_cat.set(cats[0])
         if brands: self.cmb_brand.set(brands[0])
+    def _on_tree_dblclick(self, event=None):
+        sel = self.tree.selection()
+        if not sel: return
+        vals = self.tree.item(sel[0], 'values')
+        try:
+            pid = int(vals[0])
+        except Exception:
+            return
+        prod = self.repo.get_full_by_id(pid)
+        if not prod: return
+        for k, var in self.form.vars.items():
+            v = prod.get(k)
+            if v is None:
+                var.set("")
+                continue
+            if k in ("cost_price","margin_pct","sale_price","abv"):
+                var.set(str(Decimal(v)))
+            elif k in ("stock_qty","min_stock","volume_ml","vintage","active","supplier_id"):
+                var.set(str(int(v)))
+            elif k == "expiry":
+                try:
+                    var.set(v.strftime("%Y-%m-%d") if hasattr(v, "strftime") else str(v))
+                except Exception:
+                    var.set(str(v))
+            else:
+                var.set(str(v))
     def save_product(self, data: dict):
         try:
             if not data['sku'] or not data['name']: messagebox.showwarning("Atenção", "SKU e Nome são obrigatórios."); return
@@ -562,7 +613,7 @@ class ProductPage(tb.Frame):
         for i in self.tree.get_children(): self.tree.delete(i)
         for r in rows: self.tree.insert('', 'end', values=r)
     def import_csv(self):
-        path = filedialog.askopenfilename(filetypes=[("CSV","*.csv")]); 
+        path = filedialog.askopenfilename(filetypes=[("CSV","*.csv")])
         if not path: return
         count=0; errors=0
         with open(path, newline='', encoding='utf-8') as f:
@@ -592,7 +643,8 @@ class PosPage(tb.Frame):
         tb.Button(bar, text="Adicionar", command=self.add_by_barcode, bootstyle=SUCCESS).pack(side="left")
         cols = ("product_id","name","qty","unit_price","line_total")
         self.cart = tb.Treeview(self, columns=cols, show="headings", height=12, bootstyle=WARNING)
-        for c in cols: self.cart.heading(c, text=c); self.cart.column(c, width=150)
+        headers = {'product_id':'ID','name':'Produto','qty':'Qtd','unit_price':'Preço','line_total':'Total'}
+        for c in cols: self.cart.heading(c, text=headers.get(c,c)); self.cart.column(c, width=150)
         self.cart.pack(fill="both", expand=True, padx=12, pady=12)
         pay = tb.Frame(self); pay.pack(fill="x", padx=12, pady=6)
         tb.Label(pay, text="Pagamento").pack(side="left")
@@ -609,7 +661,7 @@ class PosPage(tb.Frame):
         self.cart.bind("<Double-1>", lambda e: self.edit_qty())
         self.bind_all("<F2>", lambda e: self.finish_sale())
         self.bind_all("<F3>", lambda e: self.edit_qty())
-        self.bind_all("<F2>", lambda e: self.finish_sale()); self._recalc()
+        self._recalc()
     def add_by_barcode(self, event=None):
         code = self.ent_barcode.get().strip(); self.ent_barcode.delete(0, tk.END)
         if not code: return
@@ -638,131 +690,46 @@ class PosPage(tb.Frame):
         if not sel:
             messagebox.showwarning("Atenção", "Selecione um item para alterar a quantidade.")
             return
-
         iid = sel[0]
         pid, name, qty, unit_price, line_total = self.cart.item(iid, 'values')
-
         try:
             current = int(qty)
         except Exception:
             current = 1
-
-        new_q = simpledialog.askinteger(
-            "Alterar quantidade",
-            f"Quantidade para '{name}':",
-            initialvalue=current,
-            minvalue=0,
-            parent=self
-        )
+        new_q = simpledialog.askinteger("Alterar quantidade", f"Quantidade para '{name}':", initialvalue=current, minvalue=0, parent=self)
         if new_q is None:
             return
-
         if new_q == 0:
-            self.cart.delete(iid)
-            self._recalc()
-            return
-
-        unit_price_dec = to_decimal(unit_price)
-        line_total_dec = (unit_price_dec * new_q).quantize(MONEY_Q)
+            self.cart.delete(iid); self._recalc(); return
+        unit_price_dec = to_decimal(unit_price); line_total_dec = (unit_price_dec * new_q).quantize(MONEY_Q)
         self.cart.item(iid, values=(pid, name, new_q, f"{unit_price_dec}", f"{line_total_dec}"))
         self._recalc()
-
     def finish_sale(self):
         items = []
         for iid in self.cart.get_children():
             pid, name, qty, unit_price, line_total = self.cart.item(iid, 'values')
-            items.append({
-                'product_id': int(pid),
-                'name': name,
-                'qty': int(qty),
-                'unit_price': to_decimal(unit_price),
-                'line_total': to_decimal(line_total),
-            })
-        if not items:
-            messagebox.showwarning("Vazio", "Carrinho vazio.")
-            return
-
-        subtotal = self._recalc()
-        payment = self.cmb_pay.get()
+            items.append({'product_id': int(pid), 'name': name, 'qty': int(qty), 'unit_price': to_decimal(unit_price), 'line_total': to_decimal(line_total)})
+        if not items: messagebox.showwarning("Vazio", "Carrinho vazio."); return
+        subtotal = self._recalc(); payment = self.cmb_pay.get()
         received = to_decimal(self.ent_received.get()) if payment == 'Dinheiro' else Decimal('0')
-        discount = Decimal('0')
-        total = subtotal - discount
-        change = (received - total) if payment == 'Dinheiro' else Decimal('0')
-        if payment == 'Dinheiro' and received < total:
-            messagebox.showwarning("Atenção", "Valor recebido menor que o total.")
-            return
-
-        # usa os repos passados ao PosPage
-        sale_id = self.sales_repo.create_sale(
-            user_id=self.state['user']['id'],
-            payment_method=payment,
-            subtotal=subtotal,
-            discount=discount,
-            total=total,
-            received=received,
-            change_due=change
-        )
-
+        discount = Decimal('0'); total = subtotal - discount; change = (received - total) if payment == 'Dinheiro' else Decimal('0')
+        if payment == 'Dinheiro' and received < total: messagebox.showwarning("Atenção", "Valor recebido menor que o total."); return
+        sale_id = self.sales_repo.create_sale(user_id=self.state['user']['id'], payment_method=payment, subtotal=subtotal, discount=discount, total=total, received=received, change_due=change)
         for it in items:
-            cur = self.product_repo.db.execute(
-                "SELECT cost_price, margin_pct FROM products WHERE id=%s", (it['product_id'],)
-            )
-            cost, margin = cur.fetchone()
-            self.sales_repo.add_item(
-                sale_id=sale_id,
-                product_id=it['product_id'],
-                qty=it['qty'],
-                unit_price=it['unit_price'],
-                unit_cost=to_decimal(cost),
-                margin_pct=to_decimal(margin)
-            )
+            cur = self.product_repo.db.execute("SELECT cost_price, margin_pct FROM products WHERE id=%s", (it['product_id'],)); cost, margin = cur.fetchone()
+            self.sales_repo.add_item(sale_id=sale_id, product_id=it['product_id'], qty=it['qty'], unit_price=it['unit_price'], unit_cost=to_decimal(cost), margin_pct=to_decimal(margin))
             self.product_repo.adjust_stock(it['product_id'], -it['qty'])
-
-        cur = self.product_repo.db.execute(
-            "SELECT id, created_at, payment_method, subtotal, discount, total, received, change_due "
-            "FROM sales WHERE id=%s", (sale_id,)
-        )
-        sale_row = cur.fetchone()
-        sale = {
-            'id': sale_row[0],
-            'created_at': sale_row[1],
-            'payment_method': sale_row[2],
-            'subtotal': Decimal(sale_row[3]),
-            'discount': Decimal(sale_row[4]),
-            'total': Decimal(sale_row[5]),
-            'received': Decimal(sale_row[6]),
-            'change_due': Decimal(sale_row[7]),
-        }
-
-        items_full = [{
-            'name': it['name'],
-            'qty': it['qty'],
-            'unit_price': it['unit_price'],
-            'line_total': (it['unit_price'] * it['qty']).quantize(MONEY_Q)
-        } for it in items]
-
+        cur = self.product_repo.db.execute("SELECT id, created_at, payment_method, subtotal, discount, total, received, change_due FROM sales WHERE id=%s", (sale_id,)); sale_row = cur.fetchone()
+        sale = {'id': sale_row[0],'created_at': sale_row[1],'payment_method': sale_row[2],'subtotal': Decimal(sale_row[3]),'discount': Decimal(sale_row[4]),'total': Decimal(sale_row[5]),'received': Decimal(sale_row[6]),'change_due': Decimal(sale_row[7])}
+        items_full = [{'name': it['name'],'qty': it['qty'],'unit_price': it['unit_price'],'line_total': (it['unit_price'] * it['qty']).quantize(MONEY_Q)} for it in items]
         pix_payload = ""
         if payment == "PIX":
-            cur = self.product_repo.db.execute(
-                "SELECT store_name, pix_key, pix_merchant_city FROM settings WHERE id=1"
-            )
-            st = cur.fetchone()
-            store_name = (st[0] or "Minha Adega").upper()
-            pix_key = st[1] or ""
-            pix_city = (st[2] or "SAO PAULO").upper().replace(" ", "")
+            cur = self.product_repo.db.execute("SELECT store_name, pix_key, pix_merchant_city FROM settings WHERE id=1"); st = cur.fetchone()
+            store_name = (st[0] or "Minha Adega").upper(); pix_key = st[1] or ""; pix_city = (st[2] or "SAO PAULO").upper().replace(" ", "")
             pix_payload = build_pix_payload(pix_key, store_name, pix_city, amount=total, txid=f"VENDA{sale_id}")
-
-        self.printer.print_receipt(
-            sale, items_full, attendant_name=self.state['user']['username'], pix_payload=pix_payload
-        )
-
-        messagebox.showinfo(
-            "OK",
-            f"Venda {sale_id} concluída. Total: {money(total)}" +
-            (f" | Troco: {money(change)}" if payment == 'Dinheiro' else "")
-        )
+        self.printer.print_receipt(sale, items_full, attendant_name=self.state['user']['username'], pix_payload=pix_payload)
+        messagebox.showinfo("OK", f"Venda {sale_id} concluída. Total: {money(total)}" + (f" | Troco: {money(change)}" if payment == 'Dinheiro' else ""))
         self.clear_cart()
-
 
 class ReportsPage(tb.Frame):
     def __init__(self, master, sales_repo):
@@ -846,14 +813,17 @@ class SuppliersPage(tb.Frame):
         tb.Button(searchf, text="OK", command=self.refresh, bootstyle=PRIMARY).pack(side="left", padx=6)
         cols = ("id", "name", "document", "phone", "email", "created_at")
         self.tree = tb.Treeview(self, columns=cols, show="headings", height=12, bootstyle=INFO)
-        for c in cols: self.tree.heading(c, text=c); self.tree.column(c, width=160)
+        headers = {'id':'ID','name':'Nome','document':'Documento','phone':'Telefone','email':'E-mail','created_at':'Criado em'}
+        for c in cols: self.tree.heading(c, text=headers.get(c,c)); self.tree.column(c, width=160)
         self.tree.pack(fill="both", expand=True, padx=12, pady=12); self.tree.bind("<<TreeviewSelect>>", self.on_select)
         self.refresh()
     def save(self):
         try:
             data = {"id": self.var_id.get().strip() or None, "name": self.var_name.get().strip(),
                     "document": self.var_document.get().strip(), "phone": self.var_phone.get().strip(), "email": self.var_email.get().strip()}
-            self.repo.upsert(data); messagebox.showinfo("OK", "Fornecedor salvo/atualizado."); self.refresh(); self.clear()
+            sid = self.repo.upsert(data); messagebox.showinfo("OK", f"Fornecedor salvo/atualizado (ID {sid}).")
+            self.ent_search.delete(0, 'end')
+            self.refresh(); self.clear()
         except Exception as e: messagebox.showerror("Erro", f"Falha ao salvar: {e}")
     def clear(self):
         self.var_id.set(""); self.var_name.set(""); self.var_document.set(""); self.var_phone.set(""); self.var_email.set("")
@@ -920,7 +890,8 @@ class UsersPage(tb.Frame):
         tb.Button(frm, text="Criar", command=self.create_user, bootstyle=SUCCESS).grid(row=0, column=4, rowspan=2, padx=10)
         cols = ("id","username","role","created_at")
         self.tree = tb.Treeview(self, columns=cols, show="headings", height=14, bootstyle=INFO)
-        for c in cols: self.tree.heading(c, text=c); self.tree.column(c, width=180)
+        headers = {'id':'ID','username':'Usuário','role':'Cargo','created_at':'Criado em'}
+        for c in cols: self.tree.heading(c, text=headers.get(c,c)); self.tree.column(c, width=180)
         self.tree.pack(fill="both", expand=True, padx=12, pady=12)
         btns = tb.Frame(self); btns.pack(fill="x", padx=12, pady=8)
         tb.Button(btns, text="Resetar senha", command=self.reset_password, bootstyle=SECONDARY).pack(side="left")
@@ -944,7 +915,7 @@ class UsersPage(tb.Frame):
     def reset_password(self):
         uid = self._selected_user_id(); 
         if not uid: return
-        if uid == self.master.state['user']['id'] and not messagebox.askyesno("Confirmar", "Resetar a própria senha?"): return
+        if uid == self.current_user_id and not messagebox.askyesno("Confirmar", "Resetar a própria senha?"): return
         newp = simpledialog.askstring("Resetar senha", "Nova senha:", show="*"); 
         if not newp: return
         self.repo.set_password(uid, newp); messagebox.showinfo("OK", "Senha resetada.")
@@ -957,7 +928,7 @@ class UsersPage(tb.Frame):
     def delete_user(self):
         uid = self._selected_user_id(); 
         if not uid: return
-        if uid == self.master.state['user']['id']:
+        if uid == self.current_user_id:
             messagebox.showerror("Erro", "Não é possível excluir o usuário logado."); return
         if messagebox.askyesno("Confirmar", "Excluir usuário selecionado?"):
             try: self.repo.delete_user(uid); self.refresh()
@@ -1001,11 +972,9 @@ class AdegaApp(tb.Window):
         self.state["user"] = user
         self._build_shell()
         self.apply_branding()
-        # abre PDV após UI completa
         self.after(50, lambda: self.show_page("PDV"))
 
     def _build_shell(self):
-        # Topbar
         self.top = ttk.Frame(self, style="BrandTop.TFrame"); self.top.pack(fill="x", side="top")
         self.logo_label = ttk.Label(self.top, style="BrandTitle.TLabel"); self.logo_label.pack(side="left", padx=12, pady=8)
         self.title_label = ttk.Label(self.top, text="Quebra Tudo – Adega e Tabacaria", style="BrandTitle.TLabel"); self.title_label.pack(side="left", padx=8)
@@ -1014,15 +983,12 @@ class AdegaApp(tb.Window):
         tb.Button(right, text="Trocar senha", command=self.change_password_dialog, bootstyle=OUTLINE).pack(side="right", padx=8, pady=8)
         tb.Button(right, text="Sair", command=self.destroy, bootstyle=DANGER).pack(side="right", padx=8, pady=8)
 
-        # Status bar primeiro (para existir antes de qualquer clique)
         self.status = ttk.Frame(self, padding=6); self.status.pack(fill="x", side="bottom")
         self.lbl_status = ttk.Label(self.status, text="Pronto", style="Status.TLabel"); self.lbl_status.pack(side="left")
         self.lbl_clock = ttk.Label(self.status, text="", style="Status.TLabel"); self.lbl_clock.pack(side="right"); self._tick_clock()
 
-        # Main area: cria container de páginas ANTES dos botões
         main = ttk.Frame(self); main.pack(fill="both", expand=True)
-        self.container = tb.Frame(main, padding=6)  # ainda não pack
-        # Cria páginas
+        self.container = tb.Frame(main, padding=6)
         self.pages = {}
         self.pages["Produtos"] = ProductPage(self.container, self.product_repo)
         self.pages["PDV"] = PosPage(self.container, self.product_repo, self.sales_repo, self.printer, self.state)
@@ -1032,7 +998,6 @@ class AdegaApp(tb.Window):
         if self.state["user"]["role"] == "admin":
             self.pages["Usuários"] = UsersPage(self.container, self.user_repo, current_user_id=self.state["user"]["id"])
 
-        # Sidebar e botões
         self.sidebar = tb.Frame(main, padding=8, style="BrandSidebar.TFrame"); self.sidebar.pack(side="left", fill="y")
         self._nav_buttons = {}
         self._make_nav_button("PDV", "🧾 PDV", row=0)
@@ -1042,7 +1007,6 @@ class AdegaApp(tb.Window):
         self._make_nav_button("Configurações", "⚙️ Configurações", row=4)
         if "Usuários" in self.pages: self._make_nav_button("Usuários", "👤 Usuários", row=5)
 
-        # Por último, empacota o container das páginas
         self.container.pack(side="left", fill="both", expand=True)
 
     def _make_nav_button(self, key, text, row):
@@ -1053,7 +1017,6 @@ class AdegaApp(tb.Window):
         now = datetime.now().strftime("%d/%m/%Y %H:%M:%S"); self.lbl_clock.config(text=now); self.after(1000, self._tick_clock)
 
     def show_page(self, key):
-        # Se ainda não criou a página (usuário clicou muito cedo), tenta de novo logo depois
         if not hasattr(self, "pages") or key not in self.pages:
             self.after(60, lambda: self.show_page(key)); return
         for k, b in self._nav_buttons.items():
@@ -1081,6 +1044,12 @@ class AdegaApp(tb.Window):
 
     def apply_branding(self):
         brand = self._load_branding(); style = self.style
+        style.configure("TLabel", font=("Segoe UI", 11))
+        style.configure("TButton", font=("Segoe UI", 11))
+        style.configure("TEntry", font=("Segoe UI", 11))
+        style.configure("TCombobox", font=("Segoe UI", 11))
+        style.configure("Treeview", rowheight=28, font=("Segoe UI", 11))
+        style.configure("Treeview.Heading", font=("Segoe UI", 11, "bold"))
         style.configure("BrandTop.TFrame", background=brand["brand_bg"])
         style.configure("BrandSidebar.TFrame", background=brand["brand_sidebar"])
         style.configure("BrandTitle.TLabel", font=("Segoe UI", 14, "bold"), foreground=brand["brand_primary"], background=brand["brand_bg"])
